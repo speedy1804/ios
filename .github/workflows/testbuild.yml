@@ -1,0 +1,162 @@
+# Baut eine unsignierte Testversion der Bitwarden-App (.ipa) zum Sideloaden mit Sideloadly.
+# Läuft automatisch bei jedem Push auf den Branch "testbuild".
+
+name: Testbuild (Sideload)
+
+on:
+  push:
+    branches:
+      - testbuild
+  workflow_dispatch:
+
+env:
+  # Eigene IDs, damit die Testversion nicht mit der echten Bitwarden-App kollidiert
+  BUNDLE_ID: "de.speedy1804.bwtest"
+  CI: "true"
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+
+    steps:
+      - name: Code holen
+        uses: actions/checkout@v4
+
+      - name: Passende Xcode-Version waehlen
+        run: |
+          wanted=$(cat .xcode-version | tr -d '\n')
+          if [ -d "/Applications/Xcode_${wanted}.app" ]; then
+            sel="/Applications/Xcode_${wanted}.app"
+          else
+            sel=$(ls -d /Applications/Xcode_27*.app | sort -V | tail -1)
+            echo "::warning::Xcode ${wanted} nicht vorhanden, nehme ${sel}"
+          fi
+          sudo xcode-select -s "$sel"
+          xcodebuild -version
+
+      - name: Werkzeuge installieren (Mint, XcodeGen, SwiftGen, Sourcery ...)
+        run: |
+          brew install mint
+          mint bootstrap
+
+      - name: Eigene IDs fuer die Testversion setzen
+        run: |
+          cat > Configs/Local-bwpm.xcconfig <<EOF
+          ORGANIZATION_IDENTIFIER = de.speedy1804
+          BASE_BUNDLE_ID = ${BUNDLE_ID}
+          SHARED_APP_GROUP_IDENTIFIER = group.${BUNDLE_ID}
+          BMPW_BUNDLE_DISPLAY_NAME = BW Test
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGN_IDENTITY =
+          EOF
+          cat Configs/Local-bwpm.xcconfig
+
+      - name: Nur fuer den Testbuild - Schluesselbund-Gruppe zur Laufzeit ermitteln
+        # Die echte App bekommt ihre Team-ID beim Signieren von Bitwarden. Beim Sideloaden
+        # mit kostenloser Apple-ID kennen wir sie vorher nicht, also fragt die App sie
+        # beim Start selbst beim Schluesselbund ab. Betrifft NICHT den Face-ID-Fix.
+        run: |
+          set -euo pipefail
+          F=BitwardenKit/Core/Platform/Extensions/Bundle+Extensions.swift
+          perl -0pi -e 's/infoDictionary\?\["BitwardenKeychainAccessGroup"\] as\? String \?\? appIdentifier/BWTestKeychainGroup.value/' "$F"
+          grep -q "BWTestKeychainGroup.value" "$F" || { echo "::error::Patch fehlgeschlagen"; exit 1; }
+          cat >> "$F" <<'EOF'
+
+          import Security
+
+          /// Nur Testbuild: liefert die Standard-Schluesselbund-Gruppe (TEAMID.bundle-id) der signierten App.
+          enum BWTestKeychainGroup {
+              static let value: String = {
+                  let fallback = Bundle.main.bundleIdentifier ?? ""
+                  let query: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: "bwtest.teamid.probe",
+                      kSecAttrAccount as String: "probe",
+                      kSecReturnAttributes as String: true,
+                  ]
+                  var result: CFTypeRef?
+                  var status = SecItemCopyMatching(query as CFDictionary, &result)
+                  if status == errSecItemNotFound {
+                      var add = query
+                      add[kSecValueData as String] = Data()
+                      status = SecItemAdd(add as CFDictionary, &result)
+                  }
+                  if status == errSecSuccess,
+                     let attrs = result as? [String: Any],
+                     let group = attrs[kSecAttrAccessGroup as String] as? String {
+                      return group
+                  }
+                  return fallback
+              }()
+          }
+          EOF
+          tail -40 "$F"
+
+      - name: Xcode-Projekte erzeugen
+        run: |
+          mint run xcodegen --spec project-bwk.yml
+          mint run xcodegen --spec project-pm.yml
+
+      - name: App bauen (Release, ohne Signatur)
+        run: |
+          set -o pipefail
+          xcrun xcodebuild build \
+            -workspace Bitwarden.xcworkspace \
+            -scheme Bitwarden \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tail -200
+
+      - name: IPA zusammenpacken
+        run: |
+          set -euo pipefail
+          APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "Gefunden: $APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          APPDIR="out/Payload/$(basename "$APP")"
+
+          # Erweiterungen und Watch-App entfernen (kostenlose Apple-ID: max. 3 Apps,
+          # jede Erweiterung zaehlt mit; fuer den Face-ID-Test nicht noetig)
+          rm -rf "$APPDIR/PlugIns" "$APPDIR/Extensions" "$APPDIR/Watch"
+
+          # Nur die Berechtigungen, die eine kostenlose Apple-ID erlaubt
+          cat > out/ent.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.application-groups</key>
+            <array>
+              <string>group.${BUNDLE_ID}</string>
+            </array>
+          </dict>
+          </plist>
+          EOF
+
+          # Vorlaeufige Ad-hoc-Signatur, damit Sideloadly die Berechtigungen uebernimmt
+          if [ -d "$APPDIR/Frameworks" ]; then
+            find "$APPDIR/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) \
+              -exec codesign -f -s - {} \;
+          fi
+          codesign -f -s - --entitlements out/ent.plist "$APPDIR"
+          codesign -d --entitlements - "$APPDIR"
+
+          # Kontrolle der wichtigen Werte
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APPDIR/Info.plist"
+
+          cd out && zip -qry ../BitwardenTest.ipa Payload
+          ls -lh ../BitwardenTest.ipa
+
+      - name: IPA zum Download bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitwardenTest-ipa
+          path: BitwardenTest.ipa
+          retention-days: 7
