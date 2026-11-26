@@ -129,6 +129,33 @@ jobs:
           EOF
           tail -40 "$F"
 
+      - name: Nur fuer den Testbuild - ohne App Group auskommen
+        # Sideloadly richtet mit kostenloser Apple-ID keine App Group ein. Bitwarden erwartet
+        # aber zwingend eine und stuerzt sonst beim Start ab. Der Testbuild speichert seine
+        # Datenbank dann im normalen, privaten App-Ordner. Betrifft NICHT den Face-ID-Fix.
+        run: |
+          set -euo pipefail
+          for F in BitwardenShared/Core/Platform/Services/Stores/DataStore.swift \
+                   AuthenticatorBridgeKit/AuthenticatorBridgeDataStore.swift; do
+            perl -0pi -e 's/\.containerURL\(forSecurityApplicationGroupIdentifier: ([^)]+)\)!/.bwTestContainer($1)/g' "$F"
+            grep -q "bwTestContainer(" "$F" || { echo "::error::Patch fehlgeschlagen in $F"; exit 1; }
+            cat >> "$F" <<'EOF'
+
+          /// Nur Testbuild: App-Group-Ordner, oder der private App-Ordner, falls keine App Group da ist.
+          fileprivate extension FileManager {
+              func bwTestContainer(_ group: String) -> URL {
+                  if let url = containerURL(forSecurityApplicationGroupIdentifier: group) {
+                      return url
+                  }
+                  let url = urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                  try? createDirectory(at: url, withIntermediateDirectories: true)
+                  return url
+              }
+          }
+          EOF
+            grep -n "bwTestContainer" "$F"
+          done
+
       - name: Xcode-Projekte erzeugen
         run: |
           mint run xcodegen --spec project-bwk.yml
