@@ -53,6 +53,17 @@ jobs:
           EOF
           cat Configs/Local-bwpm.xcconfig
 
+      - name: Nur fuer den Testbuild - Firebase/Crashlytics abschalten
+        # Das oeffentliche Repo enthaelt nur eine Platzhalter-Konfiguration fuer Firebase.
+        # Im Release-Build stuerzt die App damit beim Start ab. Der Testbuild nutzt
+        # stattdessen den lokalen Logger wie Bitwardens Debug-Builds (sendet auch nichts an Google).
+        run: |
+          set -euo pipefail
+          F=Bitwarden/Application/Services/ErrorReporter/ErrorReporterFactory.swift
+          perl -0pi -e 's/#if DEBUG/#if true/' "$F"
+          grep -q "#if true" "$F" || { echo "::error::Patch fehlgeschlagen"; exit 1; }
+          cat "$F"
+
       - name: Nur fuer den Testbuild - Schluesselbund-Gruppe zur Laufzeit ermitteln
         # Die echte App bekommt ihre Team-ID beim Signieren von Bitwarden. Beim Sideloaden
         # mit kostenloser Apple-ID kennen wir sie vorher nicht, also fragt die App sie
@@ -61,7 +72,9 @@ jobs:
           set -euo pipefail
           F=BitwardenKit/Core/Platform/Extensions/Bundle+Extensions.swift
           perl -0pi -e 's/infoDictionary\?\["BitwardenKeychainAccessGroup"\] as\? String \?\? appIdentifier/BWTestKeychainGroup.value/' "$F"
-          grep -q "BWTestKeychainGroup.value" "$F" || { echo "::error::Patch fehlgeschlagen"; exit 1; }
+          perl -0pi -e 's/"group\." \+ appIdentifier/BWTestKeychainGroup.appGroup/' "$F"
+          perl -0pi -e 's/infoDictionary\?\["BitwardenAuthenticatorSharedAppGroup"\] as\? String \?\? groupIdentifier/BWTestKeychainGroup.appGroup/' "$F"
+          test "$(grep -c "BWTestKeychainGroup\." "$F")" -eq 3 || { echo "::error::Patch fehlgeschlagen"; exit 1; }
           cat >> "$F" <<'EOF'
 
           import Security
@@ -89,6 +102,28 @@ jobs:
                       return group
                   }
                   return fallback
+              }()
+
+              /// Nur Testbuild: Sideloadly kann Bundle-ID und App-Group um die Team-ID ergaenzen.
+              /// Nimmt die erste App-Group, auf die die App wirklich Zugriff hat.
+              static let appGroup: String = {
+                  let bundle = Bundle.main
+                  let appId = bundle.infoDictionary?["BitwardenAppIdentifier"] as? String
+                      ?? bundle.bundleIdentifier ?? ""
+                  let bundleId = bundle.bundleIdentifier ?? appId
+                  let team = value.split(separator: ".").first.map(String.init) ?? ""
+                  let candidates = [
+                      "group.\(appId)",
+                      "group.\(bundleId)",
+                      "group.\(appId).\(team)",
+                      "group.\(bundleId).\(team)",
+                      "group.\(team).\(appId)",
+                  ]
+                  for candidate in candidates
+                      where FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) != nil {
+                      return candidate
+                  }
+                  return "group.\(appId)"
               }()
           }
           EOF
